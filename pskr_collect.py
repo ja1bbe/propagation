@@ -13,10 +13,10 @@ PSK Reporter（日本の送受信）と宇宙天気を集めて、1時間ごと�
   2) NOAA SWPC から宇宙天気（Kp、太陽風の Bz・Bt・速度・密度、プロトン、X線）を15分ごとに取得し、
      1時間ごとの値にまとめる。
 
-保存先（DXCCフォルダの research の下。1日1ファイル、Excelでも開けるCSV）
-  research\\pskr\\YYYY-MM-DD.csv     … 報告の集計
-  research\\pskr_rx\\YYYY-MM-DD.csv  … バンドごとの日本の受信局の数
-  research\\spacewx\\YYYY-MM.csv     … 宇宙天気（1時間ごと）
+保存先（research の下。報告の集計は1時間1ファイルの圧縮CSV、宇宙天気は1か月1ファイルのCSV）
+  research/pskr/YYYY/MM/DD/HH.csv.gz     … 報告の集計
+  research/pskr_rx/YYYY/MM/DD/HH.csv.gz  … バンドごとの日本の受信局の数
+  research/spacewx/YYYY-MM.csv           … 宇宙天気（1時間ごと。後から届いた値で埋め直す）
 
 使い方
   python -m pip install paho-mqtt
@@ -25,7 +25,7 @@ PSK Reporter（日本の送受信）と宇宙天気を集めて、1時間ごと�
   24時間動かし続ける必要があるので、常時電源の入っているPCで動かしてください。
   PSK Reporter・NOAA のデータは非営利の研究に使い、取得の頻度は控えめにしています。
 """
-import csv, json, os, signal, statistics, threading, time, urllib.request
+import csv, gzip, io, json, os, signal, statistics, threading, time, urllib.request
 from collections import defaultdict
 from datetime import datetime, timezone
 
@@ -38,8 +38,8 @@ TOPICS = [f'pskr/filter/v2/+/+/+/+/+/+/+/{JAPAN}',      # 受信局が日本（R
 SWPC = 'https://services.swpc.noaa.gov'
 SW_URLS = {
     'kp': SWPC + '/products/noaa-planetary-k-index.json',
-    'mag': SWPC + '/products/solar-wind/mag-1-day.json',
-    'plasma': SWPC + '/products/solar-wind/plasma-1-day.json',
+    'mag': SWPC + '/json/rtsw/rtsw_mag_1m.json',          # リアルタイム太陽風（磁場）
+    'plasma': SWPC + '/json/rtsw/rtsw_wind_1m.json',      # リアルタイム太陽風（速度・密度）
     'proton': SWPC + '/json/goes/primary/integral-protons-1-day.json',
     'xray': SWPC + '/json/goes/primary/xrays-1-day.json',
 }
@@ -119,7 +119,7 @@ class Agg:
     def _flush_locked(self):
         if not self.hour or not self.cells:
             return
-        day = self.hour[:10]
+        y, mo, dd, hh = self.hour[0:4], self.hour[5:7], self.hour[8:10], self.hour[11:13]
         rows = []
         for (d, band, mode, area, dxc, dxf), c in self.cells.items():
             s = sorted(c['snr'])
@@ -127,8 +127,8 @@ class Agg:
                          'dx_dxcc': dxc, 'dx_field': dxf, 'n_reports': c['n'], 'n_dx': len(c['dx']),
                          'n_ja': len(c['ja']), 'snr_med': statistics.median(s) if s else '',
                          'snr_p90': s[int(0.9 * (len(s) - 1))] if s else ''})
-        _append(os.path.join(BASE, 'pskr', f'{day}.csv'), PSKR_FIELDS, rows)
-        _append(os.path.join(BASE, 'pskr_rx', f'{day}.csv'), RX_FIELDS,
+        _append_gz(os.path.join(BASE, 'pskr', y, mo, dd, f'{hh}.csv.gz'), PSKR_FIELDS, rows)
+        _append_gz(os.path.join(BASE, 'pskr_rx', y, mo, dd, f'{hh}.csv.gz'), RX_FIELDS,
                 [{'hour_utc': self.hour, 'band': b, 'n_ja_rx': len(v)} for b, v in self.rx_ja.items()])
         log(f'[PSKR] {self.hour} UTC の集計を保存（報告 {sum(c["n"] for c in self.cells.values())}件、{len(rows)}組）')
         self._reset()
@@ -144,6 +144,47 @@ def _append(path, fields, rows):
         if new:
             w.writeheader()
         w.writerows(rows)
+
+
+def _append_gz(path, fields, rows):
+    """圧縮CSVに書く（同じ時のファイルが既にあれば、圧縮の塊を後ろに足す。gzipとして正しく読める）"""
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    new = not os.path.exists(path)
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=fields)
+    if new:
+        w.writeheader()
+    w.writerows(rows)
+    with gzip.open(path, 'at', encoding='utf-8', newline='') as f:
+        f.write(buf.getvalue())
+
+
+def _upsert(path, fields, rows, key='hour_utc'):
+    """月ごとのCSVを、時をキーに書き換える（空欄は新しい値で埋め、値は新しいもので更新）"""
+    old = {}
+    if os.path.exists(path):
+        with open(path, encoding='utf-8') as f:
+            for r in csv.DictReader(f):
+                old[r[key]] = r
+    changed = 0
+    for r in rows:
+        cur = old.get(r[key], {k: '' for k in fields})
+        new = {k: (r.get(k) if r.get(k) not in ('', None) else cur.get(k, '')) for k in fields}
+        if new != cur:
+            old[r[key]] = new
+            changed += 1
+    if not changed:
+        return 0
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(old[k] for k in sorted(old))
+    os.replace(tmp, path)
+    return changed
 
 
 def run_mqtt(agg, stop):
@@ -234,12 +275,15 @@ def spacewx_hours(raw):
 
     put(_rows(raw.get('kp')), 'Kp', 'kp', max)
     put(_rows(raw.get('kp')), 'kp', 'kp', max)                       # 小文字の見出しの版にも対応
-    mag = _rows(raw.get('mag'))
+    active = lambda rows: [r for r in rows if isinstance(r, dict) and r.get('active', True) is not False]
+    mag = active(_rows(raw.get('mag')))
     put(mag, 'bz_gsm', 'bz_mean', statistics.mean)
     put(mag, 'bz_gsm', 'bz_min', min)
     put(mag, 'bt', 'bt_mean', statistics.mean)
-    pl = _rows(raw.get('plasma'))
-    put(pl, 'speed', 'speed_mean', statistics.mean)
+    pl = active(_rows(raw.get('plasma')))
+    put(pl, 'proton_speed', 'speed_mean', statistics.mean)
+    put(pl, 'proton_density', 'density_mean', statistics.mean)
+    put(pl, 'speed', 'speed_mean', statistics.mean)           # 旧形式の見出しにも対応
     put(pl, 'density', 'density_mean', statistics.mean)
     put(_rows(raw.get('proton')), 'flux', 'proton10_max', max, lambda r: r.get('energy') == '>=10 MeV')
     put(_rows(raw.get('xray')), 'flux', 'xray_max', max, lambda r: r.get('energy') == '0.1-0.8nm')
@@ -255,16 +299,6 @@ def spacewx_hours(raw):
 
 
 class SpaceWx:
-    def __init__(self):
-        self.written = set()          # 保存済みの時（その月のファイルから読む）
-
-    def _load_written(self, month):
-        p = os.path.join(BASE, 'spacewx', f'{month}.csv')
-        if os.path.exists(p):
-            with open(p, encoding='utf-8') as f:
-                for r in csv.DictReader(f):
-                    self.written.add(r['hour_utc'])
-
     def fetch_once(self):
         try:
             raw = {}
@@ -275,18 +309,14 @@ class SpaceWx:
                     log(f'[宇宙天気] {k} を取得できませんでした: {e}')
             hours = spacewx_hours(raw)
             now_hour = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:00')
-            done = [h for h in sorted(hours) if h < now_hour]          # 終わった時だけ保存
             by_month = defaultdict(list)
-            for h in done:
-                m = h[:7]
-                if not any(x.startswith(m) for x in self.written):
-                    self._load_written(m)
-                if h not in self.written:
-                    by_month[m].append({'hour_utc': h, **{k: hours[h].get(k, '') for k in SW_FIELDS[1:]}})
-                    self.written.add(h)
+            for h in sorted(hours):
+                if h < now_hour:                                   # 終わった時だけ
+                    by_month[h[:7]].append({'hour_utc': h, **{k: hours[h].get(k, '') for k in SW_FIELDS[1:]}})
             for m, rows in by_month.items():
-                _append(os.path.join(BASE, 'spacewx', f'{m}.csv'), SW_FIELDS, rows)
-                log(f'[宇宙天気] {len(rows)}時間分を保存')
+                n = _upsert(os.path.join(BASE, 'spacewx', f'{m}.csv'), SW_FIELDS, rows)
+                if n:
+                    log(f'[宇宙天気] {m}: {n}時間分を保存・更新')
         except Exception as e:
             log(f'[宇宙天気] 処理中にエラー: {e}')
 

@@ -10,10 +10,10 @@ JA1BBE による、宇宙天気と HF 伝搬の関係を調べるための予備
 ## データ（data/）
 | ファイル | 内容 |
 |---|---|
-| pskr/YYYY-MM-DD.csv | 時・向き・バンド・モード・日本側のコールエリア・相手の DXCC・相手のグリッド大区画ごとの報告数、局数、SNR |
-| pskr_rx/YYYY-MM-DD.csv | バンドごとの、報告した日本の受信局の数（正規化の基準） |
+| pskr/YYYY/MM/DD/HH.csv.gz | 時・向き・バンド・モード・日本側のコールエリア・相手の DXCC・相手のグリッド大区画ごとの報告数、局数、SNR |
+| pskr_rx/YYYY/MM/DD/HH.csv.gz | バンドごとの、報告した日本の受信局の数（正規化の基準） |
 | samples.csv | 各時の抜き取りの開始時刻と秒数 |
-| spacewx/YYYY-MM.csv | 宇宙天気の1時間ごとの値 |
+| spacewx/YYYY-MM.csv | 宇宙天気の1時間ごとの値（後から届いた値で埋め直す） |
 
 ## 出典
 - PSK Reporter（Philip Gladstone, N1DQ）とその MQTT 配信
