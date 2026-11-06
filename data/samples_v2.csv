@@ -1,0 +1,2 @@
+sample_id,hour_utc,start_utc,mid_utc,end_utc,listen_seconds,reports,report_t_min_utc,report_t_max_utc,version
+202611061009,2026-11-06 10:00,2026-11-06 10:09:25,2026-11-06 10:13:25,2026-11-06 10:17:25,480,18607,2026-11-06 10:03:30,2026-11-06 10:17:14,2
