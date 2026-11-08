@@ -1,0 +1,37 @@
+name: GFZ の地磁気・太陽指数の取り込み
+
+on:
+  schedule:
+    - cron: "40 2 * * *"       # 毎日 02:40 UTC。毎月3日は全期間を取り込み直す
+  workflow_dispatch:           # Actions の画面から手動でも実行できる
+    inputs:
+      mode:
+        description: "auto / daily / full"
+        default: "auto"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: gfz
+  cancel-in-progress: false
+
+jobs:
+  gfz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: GFZ から取り込む
+        run: python gfz_collect.py --mode "${{ github.event.inputs.mode || 'auto' }}"
+      - name: 保存する
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/gfz
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "gfz $(date -u +%Y-%m-%dT%H:%MZ)"
+          for i in 1 2 3; do git pull --rebase && git push && break; sleep 10; done
