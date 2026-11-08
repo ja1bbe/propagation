@@ -2,7 +2,7 @@ name: 伝搬データの収集（抜き取り）
 
 on:
   schedule:
-    - cron: "12 * * * *"       # 毎時12分に起動（UTC）。8分間受け取る
+    - cron: "12,32,52 * * * *" # 20分ごとに起動（UTC）。8分間受け取る。間引かれても取りこぼしにくくするため
   workflow_dispatch:           # Actions の画面から手動でも実行できる
 
 permissions:
