@@ -25,7 +25,11 @@ jobs:
         run: python -m pip install paho-mqtt
       - name: 8分間受け取って集計する
         run: python sample_collect.py --minutes 8
+      - name: DXクラスター（DX Summit）の日本の局のスポットを記録する
+        if: ${{ !cancelled() }}          # 失敗しても伝搬データの保存は行う
+        run: python cluster_collect.py
       - name: 保存する
+        if: ${{ !cancelled() }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -33,3 +37,4 @@ jobs:
           if git diff --cached --quiet; then exit 0; fi
           git commit -m "data $(date -u +%Y-%m-%dT%H:%MZ)"
           for i in 1 2 3; do git pull --rebase && git push && break; sleep 10; done
+
