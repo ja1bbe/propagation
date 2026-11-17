@@ -12,6 +12,9 @@
   ・n：その時刻の抜き取りの回数（割合の分母）。
   ・wr／wd（エンティティのみ）：各時刻の前後1時間で、受信できた回の割合（1文字＝5%刻み、0〜k＝0〜100%）と、
     受信できた日数（1文字、0〜z＝0〜35日）。ページの「いまお勧めのバンド」の判定に使う。
+  ・pl／plh（エンティティのローバンドのみ）：受信できた回を、その時刻の短経路・長経路の昼夜で分けた回数
+    [判別できた回, 短経路だけ通り得た, 長経路だけ, 両方, どちらも難しい] と、長経路だけ通り得た回の時刻ごとの数。
+  ・c：DXクラスターの日本の局のスポット。エンティティ×バンドごとの件数（n）、LP・SP・skew の記載の件数、LP の時刻ごとの数（lph）。
   ・w：受信できた回（o）と、同じ時刻の抜き取り全体（b）の宇宙天気の中央値 [回数, Kp, 太陽風の速さ km/s, SFI]。
   ・割合は24時間分を24文字で表す。1文字が1時間（0時〜23時UTC）で、0＝報告なし、1＝15%未満（1回でも報告があれば1）、2＝約20%…9＝約90%、A＝100%。
 
@@ -19,7 +22,7 @@
 
   python summarize.py --days 28
 """
-import argparse, glob, gzip, io, json, os
+import argparse, glob, gzip, io, json, math, os, urllib.request
 from datetime import datetime, timedelta, timezone
 import csv
 from statistics import median
@@ -60,7 +63,57 @@ def fnum(x, bad=-1):
         return None
 SW = {}   # 抜き取り → (Kp, 太陽風の速さ, SFI)
 
+# ---- 短経路・長経路の物理の判別（ローバンドのみ）
+#   受信できた抜き取りの中央の時刻に、短経路と長経路のそれぞれが「途中の大半が夜」だったかを計算する。
+#   ローバンドは昼側でD層の吸収が強いので、片方だけが夜なら、その経路で届いた可能性が高い。
+CTY_URL = 'https://raw.githubusercontent.com/ja1bbe/ja1bbe-iono/main/docs/cty.json'
+try:
+    CTY = json.loads(urllib.request.urlopen(urllib.request.Request(CTY_URL, headers={'User-Agent': 'ja1bbe-propagation/1.0'}), timeout=30).read())
+except Exception as e:
+    print('cty.json を読めなかったため、短経路・長経路の判別は省きます：', e)
+    CTY = None
+JA_POS = (35.7, 139.7)
+LOW = ('160m', '80m', '40m')
+RE = 6371.0
+def sun_elev(lat, lon, t):
+    d = (t - datetime(2000, 1, 1, 12, tzinfo=timezone.utc)).total_seconds() / 86400
+    g = math.radians(357.529 + 0.98560028 * d); q = 280.459 + 0.98564736 * d
+    L = math.radians(q + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g)); e = math.radians(23.439 - 0.00000036 * d)
+    dec = math.asin(math.sin(e) * math.sin(L)); ra = math.atan2(math.cos(e) * math.sin(L), math.cos(L))
+    ha = math.radians((280.46061837 + 360.98564736629 * d) % 360 + lon) - ra; la = math.radians(lat)
+    return math.degrees(math.asin(math.sin(la) * math.sin(dec) + math.cos(la) * math.cos(dec) * math.cos(ha)))
+def gc(a, b):
+    la1, lo1, la2, lo2 = map(math.radians, (*a, *b))
+    d = math.acos(max(-1, min(1, math.sin(la1) * math.sin(la2) + math.cos(la1) * math.cos(la2) * math.cos(lo2 - lo1))))
+    az = math.atan2(math.sin(lo2 - lo1) * math.cos(la2), math.cos(la1) * math.sin(la2) - math.sin(la1) * math.cos(la2) * math.cos(lo2 - lo1))
+    return d * RE, az
+def dest(a, az, km):
+    la1, lo1 = map(math.radians, a); s = km / RE
+    la = math.asin(math.sin(la1) * math.cos(s) + math.cos(la1) * math.sin(s) * math.cos(az))
+    lo = lo1 + math.atan2(math.sin(az) * math.sin(s) * math.cos(la1), math.cos(s) - math.sin(la1) * math.sin(la))
+    return math.degrees(la), math.degrees(lo)
+def dark_frac(a, az, km, t, margin=1000, n=30):
+    if km < 2 * margin + 500:
+        return None
+    pts = [dest(a, az, margin + (km - 2 * margin) * i / (n - 1)) for i in range(n)]
+    return sum(1 for la, lo in pts if sun_elev(la, lo, t) < -6) / n
+PCLS = {}
+def path_class(ei, sid):
+    # 0：短経路だけ通り得た、1：長経路だけ、2：両方、3：どちらも難しい（いずれも途中の7割以上が夜かで判定）
+    k = (ei, sid)
+    if k in PCLS:
+        return PCLS[k]
+    e = CTY['ent'][ei]; tgt = (e[1], e[2]); t = SMID[sid]
+    d, az = gc(JA_POS, tgt)
+    sp, lp = dark_frac(JA_POS, az, d, t), dark_frac(JA_POS, az + math.pi, 2 * math.pi * RE - d, t)
+    if sp is None:
+        PCLS[k] = None; return None
+    so, lo = sp >= 0.7, lp >= 0.7
+    PCLS[k] = 0 if so and not lo else 1 if lo and not so else 2 if so else 3
+    return PCLS[k]
+
 # 抜き取りの一覧（第2版のみ）
+SMID = {}
 SDATE = {}
 samples = {}
 with open(os.path.join(BASE, 'samples_v2.csv'), newline='', encoding='utf-8') as f:
@@ -69,6 +122,7 @@ with open(os.path.join(BASE, 'samples_v2.csv'), newline='', encoding='utf-8') as
         if t >= since:
             samples[r['sample_id']] = int(r['hour_utc'][11:13])
             SDATE[r['sample_id']] = r['hour_utc'][:10]
+            SMID[r['sample_id']] = datetime.strptime(r['mid_utc'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
             g = GFZ.get(r['hour_utc'][:10], {})
             h = int(r['hour_utc'][11:13])
             SW[r['sample_id']] = (fnum(g.get(f'kp{h // 3 + 1}')), SPEED.get(r['hour_utc']), fnum(g.get('f107obs')))
@@ -139,12 +193,48 @@ for (kind, key, band), (sa, sr, st) in seen.items():
             wr.append(B36[min(20, round(20 * len(got) / tot))] if tot else '0')
             wd.append(B36[min(35, len({SDATE[s_] for s_ in got}))])
         item['wr'] = ''.join(wr); item['wd'] = ''.join(wd)
+    if kind == 'e' and band in LOW and CTY and len(sr) >= 3:
+        cls = [0, 0, 0, 0]; lph = [0] * 24
+        for s_ in sr:
+            c = path_class(int(key), s_)
+            if c is None:
+                continue
+            cls[c] += 1
+            if c == 1:
+                lph[samples[s_]] += 1
+        if sum(cls):
+            item['pl'] = [sum(cls)] + cls          # [判別できた回, 短経路だけ, 長経路だけ, 両方, どちらも難しい]
+            item['plh'] = ''.join(B36[min(35, x)] for x in lph)   # 長経路だけ通り得た回の、時刻ごとの数
     if len(sr) >= 5:         # 中央値に意味が出るよう、受信できた回が5回以上のときだけ
         # 受信できた回の宇宙天気と、同じ時刻（受信の報告があった UTC の時）の抜き取り全体の宇宙天気
         hours = {samples[s] for s in sr}
         base = [s for h in hours for s in by_hour.get(h, [])]
         item['w'] = {'o': sw_med(sr), 'b': sw_med(base)}
     out[kind].setdefault(key, {})[band] = item
+
+# ---- DXクラスター（日本の局のスポット）：エンティティ×バンドごとの件数と、LP・SP・skew の記載の件数
+out['c'] = {}
+for path in glob.glob(os.path.join(BASE, 'cluster', '*.csv')):
+    with open(path, newline='', encoding='utf-8') as f:
+        for r in csv.DictReader(f):
+            try:
+                t = datetime.strptime(r['time_utc'], '%Y-%m-%d %H:%M').replace(tzinfo=timezone.utc)
+            except (KeyError, ValueError):
+                continue
+            if t < since or r.get('band') not in BANDS:
+                continue
+            c = out['c'].setdefault(str(r['ent']), {}).setdefault(r['band'], {'n': 0, 'lp': 0, 'sp': 0, 'sk': 0, 'lph': [0] * 24})
+            c['n'] += 1
+            p_ = r.get('path', '')
+            if p_ == 'LP':
+                c['lp'] += 1; c['lph'][t.hour] += 1
+            elif p_ == 'SP':
+                c['sp'] += 1
+            elif p_ == 'SKEW':
+                c['sk'] += 1
+for ent in out['c'].values():
+    for c in ent.values():
+        c['lph'] = ''.join(B36[min(35, x)] for x in c['lph'])
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, 'w', encoding='utf-8') as f:
