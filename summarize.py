@@ -10,6 +10,8 @@
   ・時刻は抜き取りの中央の時刻（UTC）で分ける。
   ・a：送受信どちらかの報告があった割合、r：日本の局が相手を受信、t：日本の局の信号が相手側で受信。
   ・n：その時刻の抜き取りの回数（割合の分母）。
+  ・wr／wd（エンティティのみ）：各時刻の前後1時間で、受信できた回の割合（1文字＝5%刻み、0〜k＝0〜100%）と、
+    受信できた日数（1文字、0〜z＝0〜35日）。ページの「いまお勧めのバンド」の判定に使う。
   ・w：受信できた回（o）と、同じ時刻の抜き取り全体（b）の宇宙天気の中央値 [回数, Kp, 太陽風の速さ km/s, SFI]。
   ・割合は24時間分を24文字で表す。1文字が1時間（0時〜23時UTC）で、0＝報告なし、1＝15%未満（1回でも報告があれば1）、2＝約20%…9＝約90%、A＝100%。
 
@@ -59,12 +61,14 @@ def fnum(x, bad=-1):
 SW = {}   # 抜き取り → (Kp, 太陽風の速さ, SFI)
 
 # 抜き取りの一覧（第2版のみ）
+SDATE = {}
 samples = {}
 with open(os.path.join(BASE, 'samples_v2.csv'), newline='', encoding='utf-8') as f:
     for r in csv.DictReader(f):
         t = datetime.strptime(r['start_utc'], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
         if t >= since:
             samples[r['sample_id']] = int(r['hour_utc'][11:13])
+            SDATE[r['sample_id']] = r['hour_utc'][:10]
             g = GFZ.get(r['hour_utc'][:10], {})
             h = int(r['hour_utc'][11:13])
             SW[r['sample_id']] = (fnum(g.get(f'kp{h // 3 + 1}')), SPEED.get(r['hour_utc']), fnum(g.get('f107obs')))
@@ -95,6 +99,7 @@ for path in glob.glob(os.path.join(BASE, 'pskr', '*', '*', '*', '????.csv.gz')):
             if len(fld) == 2:
                 mark('f', fld, r['band'], r['dir'], sid)
 
+B36 = '0123456789abcdefghijklmnopqrstuvwxyz'
 LV = '0123456789A'   # 割合を10%刻みの1文字で表す（0＝0%、5＝50%、A＝100%）。ファイルを小さく保つため
 def pct(sids):
     c = [0] * 24
@@ -121,6 +126,19 @@ for (kind, key, band), (sa, sr, st) in seen.items():
     if len(sa) < 2:          # 1回だけの報告は偶然の可能性が高いので載せない
         continue
     item = {'a': pct(sa), 'r': pct(sr), 't': pct(st)}
+    if kind == 'e' and sr:
+        # 「いまお勧めのバンド」の判定用：各時刻の前後1時間（3時間）で、受信できた回の割合（5%刻み）と、受信できた日数
+        hr = {}
+        for s_ in sr:
+            hr.setdefault(samples[s_], []).append(s_)
+        wr, wd = [], []
+        for h in range(24):
+            win = [(h + d) % 24 for d in (-1, 0, 1)]
+            got = [s_ for w in win for s_ in hr.get(w, [])]
+            tot = sum(n_hour[w] for w in win)
+            wr.append(B36[min(20, round(20 * len(got) / tot))] if tot else '0')
+            wd.append(B36[min(35, len({SDATE[s_] for s_ in got}))])
+        item['wr'] = ''.join(wr); item['wd'] = ''.join(wd)
     if len(sr) >= 5:         # 中央値に意味が出るよう、受信できた回が5回以上のときだけ
         # 受信できた回の宇宙天気と、同じ時刻（受信の報告があった UTC の時）の抜き取り全体の宇宙天気
         hours = {samples[s] for s in sr}
