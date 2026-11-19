@@ -16,6 +16,10 @@
     [判別できた回, 短経路だけ通り得た, 長経路だけ, 両方, どちらも難しい] と、長経路だけ通り得た回の時刻ごとの数。
   ・c：DXクラスターの日本の局のスポット。エンティティ×バンドごとの件数（n）、LP・SP・skew の記載の件数、LP の時刻ごとの数（lph）。
   ・w：受信できた回（o）と、同じ時刻の抜き取り全体（b）の宇宙天気の中央値 [回数, Kp, 太陽風の速さ km/s, SFI]。
+  ・d：ローバンドの遠距離の強い受信（電離圏ダクトの可能性の表示に使う）。160m・80m で、日本の局が 8000km 以上離れた
+    相手（グリッド大区画の中心で判定）を、受信した日本の局の上位1割の SNR が −5dB 以上で受信した件数を、
+    時刻（UTC）× 地域（na 北米、eu 欧州、ot その他）ごとに数える。件数は抜き取りの記録の行（抜き取り×向き×モード×
+    日本のコールエリア×相手のグリッド大区画）の数で、2026-11-06〜18 の固定のグラフと同じ数え方。
   ・割合は24時間分を24文字で表す。1文字が1時間（0時〜23時UTC）で、0＝報告なし、1＝15%未満（1回でも報告があれば1）、2＝約20%…9＝約90%、A＝100%。
 
 エンティティは PSK Reporter の ADIF 番号を、ナウキャストが使う cty.json の並び順の番号に対応させる（adif_cty.json）。
@@ -132,6 +136,18 @@ for h in samples.values():
 
 # 抜き取りごとに、どの相手・バンド・向きで報告があったかを集める
 seen = {}   # (kind, key, band) -> [set(sid) for any, rx, tx]
+DUCT = {b: {g: [0] * 24 for g in ('na', 'eu', 'ot')} for b in ('160m', '80m')}
+def fld_ll(fld):
+    return ((ord(fld[1]) - 65) * 10 - 90 + 5, (ord(fld[0]) - 65) * 20 - 180 + 10)
+def dist_km(a, b):
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    c = math.sin(la1) * math.sin(la2) + math.cos(la1) * math.cos(la2) * math.cos(lo2 - lo1)
+    return RE * math.acos(max(-1.0, min(1.0, c)))
+def duct_grp(la, lo):
+    if lo < -30:
+        return 'na' if la > 10 else 'ot'
+    return 'eu' if lo < 60 and la > 30 else 'ot'
+
 def mark(kind, key, band, d, sid):
     s = seen.setdefault((kind, key, band), (set(), set(), set()))
     s[0].add(sid); (s[1] if d == 'RX' else s[2]).add(sid)
@@ -152,6 +168,16 @@ for path in glob.glob(os.path.join(BASE, 'pskr', '*', '*', '*', '????.csv.gz')):
             fld = (r['dx_field'] or '').upper()
             if len(fld) == 2:
                 mark('f', fld, r['band'], r['dir'], sid)
+                # ローバンドの遠距離の強い受信（d）
+                if r['dir'] == 'RX' and r['band'] in DUCT and fld.isalpha():
+                    try:
+                        p90 = float(r['snr_p90'])
+                    except (KeyError, TypeError, ValueError):
+                        p90 = None
+                    if p90 is not None and p90 >= -5:
+                        ll = fld_ll(fld)
+                        if dist_km(JA_POS, ll) >= 8000:
+                            DUCT[r['band']][duct_grp(*ll)][samples[sid]] += 1
 
 B36 = '0123456789abcdefghijklmnopqrstuvwxyz'
 LV = '0123456789A'   # 割合を10%刻みの1文字で表す（0＝0%、5＝50%、A＝100%）。ファイルを小さく保つため
@@ -235,6 +261,8 @@ for path in glob.glob(os.path.join(BASE, 'cluster', '*.csv')):
 for ent in out['c'].values():
     for c in ent.values():
         c['lph'] = ''.join(B36[min(35, x)] for x in c['lph'])
+
+out['d'] = DUCT
 
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 with open(OUT, 'w', encoding='utf-8') as f:
