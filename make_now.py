@@ -5,8 +5,9 @@
 
   recent ：直近3時間に、日本の局が受信できたエンティティ（バンドごと）
            ・日本の局2局以上（または2つ以上のコールエリア）が受信したもの。1局だけの報告は、抜き取り3回以上で、
-             160m・80m・60m では、日本側の太陽高度が +5° 未満で、短経路か長経路の半分以上が夜のときだけ
-             （読み違いや、ありえない受信の報告を除くため）
+             160m・80m・60m では短経路か長経路の半分以上が夜のときだけ
+           ・160m・80m・60m は、日本側の太陽高度が +5° 以上（はっきり昼）の受信を、局数にかかわらず載せない
+             （読み違いや、ありえない受信の報告を除くため。日の出・日没の前後のグレイラインの受信は残る）
            ・「最近の日本の記録ではまれ」なものを先に、残りを遠い順に、各バンド最大8つ
   outlook：これから3時間の見通し（過去の記録の部分だけ。宇宙天気による補正は、読む側が最新の値で行う）
            ・直近28日間の集計（paths.json）で、これからの3時間のいずれかに受信の割合が3割以上、
@@ -94,6 +95,13 @@ def sample_time(sid):
     except ValueError:
         return None
 
+LOW = ('160m', '80m', '60m')
+_DAY = {}
+def day_sample(st):
+    if st not in _DAY:
+        _DAY[st] = sun_elev(JA_POS[0], JA_POS[1], st + timedelta(minutes=4)) >= 5
+    return _DAY[st]
+
 def read_rx(t0, t1):
     """t0〜t1 に始まった抜き取りの受信（RX）の記録。{band: {cty番号: {s:抜き取りの集合, ja:最大の日本の局数, snr:最良}}} と抜き取りの数"""
     out = {b: {} for b in BANDS}
@@ -115,6 +123,9 @@ def read_rx(t0, t1):
                         continue
                     sids.add(r['sample_id'])
                     if r.get('dir') != 'RX' or r.get('band') not in out:
+                        continue
+                    # ローバンドは、日本側がはっきり昼（太陽高度 +5° 以上）の抜き取りの報告を、局数にかかわらず使わない
+                    if r['band'] in LOW and day_sample(st):
                         continue
                     try:
                         i = adif.get(int(r['dx_dxcc']))
@@ -163,7 +174,6 @@ def dark_frac(b, t, long_path=False, n=60):
             dk += 1
     return dk / (n + 1)
 
-LOW = ('160m', '80m', '60m')
 def credible(x, band=None, ent=None):
     # 日本の局2局以上、または2つ以上のコールエリアから報告されたものは載せる
     if x['ja'] >= 2 or len(x['areas']) >= 2:
@@ -173,8 +183,6 @@ def credible(x, band=None, ent=None):
         return False
     if band in LOW and CTY and ent is not None and ent < len(CTY['ent']):
         e = CTY['ent'][ent]
-        if sun_elev(JA_POS[0], JA_POS[1], x['last']) >= 5:      # 日本側が昼（D層の吸収が強い）
-            return False
         return max(dark_frac((e[1], e[2]), x['last']), dark_frac((e[1], e[2]), x['last'], True)) >= 0.5
     return True
 
