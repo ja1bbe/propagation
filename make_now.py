@@ -4,6 +4,7 @@
 宇宙天気の通知メール（ja1bbe-iono の sw_alert.py）と、宇宙天気ナウキャストのページが読む。
 
   recent ：直近3時間に、日本の局が受信できたエンティティ（バンドごと）
+           ・all：そのバンドで受信できたすべてのエンティティ（cty.json の番号）
            ・日本の局2局以上（または2つ以上のコールエリア）が受信したもの。1局だけの報告は、抜き取り3回以上で、
              160m・80m・60m では短経路か長経路の半分以上が夜のときだけ
            ・160m・80m・60m は、日本側の太陽高度が +5° 以上（はっきり昼）の受信を、局数にかかわらず載せない
@@ -204,7 +205,8 @@ for b in BANDS:
     if not cand:
         continue
     cand.sort(key=lambda c: (not c['rare'], c['rs'] if c['rare'] else 0, -c['km']))
-    recent[b] = {'n': len(cand), 'top': [{k: v for k, v in c.items() if k != 'rs'} for c in cand[:TOP]]}
+    recent[b] = {'n': len(cand), 'top': [{k: v for k, v in c.items() if k != 'rs'} for c in cand[:TOP]],
+                 'all': sorted(c['e'] for c in cand)}   # 英語版で、訪れた局の国が受信されていたかを調べるため
 
 # ---- これから3時間の見通し（過去の記録の部分）
 h0 = (now.hour + (1 if now.minute >= 30 else 0)) % 24
