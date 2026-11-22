@@ -28,6 +28,9 @@ jobs:
       - name: DXクラスター（DX Summit）の日本の局のスポットを記録する
         if: ${{ !cancelled() }}          # 失敗しても伝搬データの保存は行う
         run: python cluster_collect.py
+      - name: いまのまとめ（直近3時間・3時間の見通し・採点）を書き出す
+        if: ${{ !cancelled() }}
+        run: python make_now.py
       - name: 保存する
         if: ${{ !cancelled() }}
         run: |
