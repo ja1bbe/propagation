@@ -4,7 +4,9 @@
 宇宙天気の通知メール（ja1bbe-iono の sw_alert.py）と、宇宙天気ナウキャストのページが読む。
 
   recent ：直近3時間に、日本の局が受信できたエンティティ（バンドごと）
-           ・抜き取り2回以上、または日本の局2局以上が受信したものだけ（読み違いのコールサインを除くため）
+           ・日本の局2局以上（または2つ以上のコールエリア）が受信したもの。1局だけの報告は、抜き取り3回以上で、
+             160m・80m・60m では、日本側の太陽高度が +5° 未満で、短経路か長経路の半分以上が夜のときだけ
+             （読み違いや、ありえない受信の報告を除くため）
            ・「最近の日本の記録ではまれ」なものを先に、残りを遠い順に、各バンド最大8つ
   outlook：これから3時間の見通し（過去の記録の部分だけ。宇宙天気による補正は、読む側が最新の値で行う）
            ・直近28日間の集計（paths.json）で、これからの3時間のいずれかに受信の割合が3割以上、
@@ -120,8 +122,11 @@ def read_rx(t0, t1):
                         continue
                     if i is None or i == JAPAN:
                         continue
-                    x = out[r['band']].setdefault(i, {'s': set(), 'ja': 0, 'snr': -99.0})
+                    x = out[r['band']].setdefault(i, {'s': set(), 'ja': 0, 'snr': -99.0, 'areas': set(), 'last': st})
                     x['s'].add(r['sample_id'])
+                    x['areas'].add(r.get('ja_area'))
+                    if st > x['last']:
+                        x['last'] = st
                     try:
                         x['ja'] = max(x['ja'], int(r.get('n_ja') or 0))
                     except ValueError:
@@ -133,8 +138,45 @@ def read_rx(t0, t1):
         day += timedelta(days=1)
     return out, len(sids)
 
-def credible(x):
-    return len(x['s']) >= 2 or x['ja'] >= 2
+# ---- 太陽の高さと経路の暗さ（1局だけの報告を、物理の条件で確かめるため）
+R = math.pi / 180
+def sun_elev(la, lo, t):
+    d = (t - datetime(2000, 1, 1, 12, tzinfo=timezone.utc)).total_seconds() / 86400
+    g = (357.529 + 0.98560028 * d) * R; q = 280.459 + 0.98564736 * d
+    L = (q + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g)) * R; e = (23.439 - 0.00000036 * d) * R
+    ra = math.atan2(math.cos(e) * math.sin(L), math.cos(L)); dec = math.asin(math.sin(e) * math.sin(L))
+    gm = (18.697374558 + 24.06570982441908 * d) % 24; ha = (gm * 15 + lo) * R - ra
+    return math.asin(math.sin(la * R) * math.sin(dec) + math.cos(la * R) * math.cos(dec) * math.cos(ha)) / R
+def dark_frac(b, t, long_path=False, n=60):
+    # 日本（JA_POS）から相手の代表位置までの短経路・長経路のうち、太陽高度 −6° 以下の割合
+    la1, lo1, la2, lo2 = JA_POS[0] * R, JA_POS[1] * R, b[0] * R, b[1] * R
+    p1 = (math.cos(la1) * math.cos(lo1), math.cos(la1) * math.sin(lo1), math.sin(la1))
+    p2 = (math.cos(la2) * math.cos(lo2), math.cos(la2) * math.sin(lo2), math.sin(la2))
+    dot = max(-1.0, min(1.0, sum(u * v for u, v in zip(p1, p2)))); ang = math.acos(dot)
+    w = [v - dot * u for u, v in zip(p1, p2)]; nw = math.sqrt(sum(c * c for c in w)) or 1.0; w = [c / nw for c in w]
+    span = -(2 * math.pi - ang) if long_path else ang
+    dk = 0
+    for k in range(n + 1):
+        a_ = span * k / n
+        p = [math.cos(a_) * u + math.sin(a_) * v for u, v in zip(p1, w)]
+        if sun_elev(math.asin(p[2]) / R, math.atan2(p[1], p[0]) / R, t) < -6:
+            dk += 1
+    return dk / (n + 1)
+
+LOW = ('160m', '80m', '60m')
+def credible(x, band=None, ent=None):
+    # 日本の局2局以上、または2つ以上のコールエリアから報告されたものは載せる
+    if x['ja'] >= 2 or len(x['areas']) >= 2:
+        return True
+    # 1局だけの報告：抜き取り3回以上。ローバンドでは、短経路か長経路の半分以上が夜であることも条件にする
+    if len(x['s']) < 3:
+        return False
+    if band in LOW and CTY and ent is not None and ent < len(CTY['ent']):
+        e = CTY['ent'][ent]
+        if sun_elev(JA_POS[0], JA_POS[1], x['last']) >= 5:      # 日本側が昼（D層の吸収が強い）
+            return False
+        return max(dark_frac((e[1], e[2]), x['last']), dark_frac((e[1], e[2]), x['last'], True)) >= 0.5
+    return True
 
 # ---- 直近3時間
 t_from = now - timedelta(hours=3)
@@ -143,7 +185,7 @@ recent = {}
 for b in BANDS:
     cand = []
     for i, x in rx[b].items():
-        if not credible(x):
+        if not credible(x, b, i):
             continue
         name, km = ent_info(i)
         if name is None:
@@ -200,7 +242,7 @@ for h in hist:
     day = t_issue.strftime('%Y-%m-%d')
     sd = score.setdefault(day, {})
     for b in BANDS:
-        heard = {i for i, x in act[b].items() if credible(x)}
+        heard = {i for i, x in act[b].items() if credible(x, b, i)}
         o = h.get('o', {}).get(b, [])
         p = h.get('p', {}).get(b, [])
         if not o and not p:
