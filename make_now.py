@@ -1,0 +1,245 @@
+# -*- coding: utf-8 -*-
+"""
+抜き取りのたびに、「いま」のまとめを data/summary/now.json に書き出す。
+宇宙天気の通知メール（ja1bbe-iono の sw_alert.py）と、宇宙天気ナウキャストのページが読む。
+
+  recent ：直近3時間に、日本の局が受信できたエンティティ（バンドごと）
+           ・抜き取り2回以上、または日本の局2局以上が受信したものだけ（読み違いのコールサインを除くため）
+           ・「最近の日本の記録ではまれ」なものを先に、残りを遠い順に、各バンド最大8つ
+  outlook：これから3時間の見通し（過去の記録の部分だけ。宇宙天気による補正は、読む側が最新の値で行う）
+           ・直近28日間の集計（paths.json）で、これからの3時間のいずれかに受信の割合が3割以上、
+             かつ受信できた日が3日以上のエンティティ
+           ・まれなものを先に、各バンド最大8つ
+  score  ：見通しの採点。毎時最初の抜き取りで出した見通しを3時間後に、実際の受信と突き合わせる。
+           比較のため、「直近3時間に受信できたものは、次の3時間にも受信できる」という単純な見込み（持続）も
+           同じように採点する。日ごとの合計を data/summary/outlook_score.json に残す。
+
+「まれ」：直近28日間の集計で、そのエンティティ×バンドの受信の割合（24時間分）の合計が小さいもの
+         （1時間ごとの割合を 0〜10 で表した値の合計が 4 以下、または記録なし）。
+         DXCC として珍しいという意味ではなく、「最近の日本の記録ではまれ」という意味。
+
+  python make_now.py
+"""
+import csv, glob, gzip, json, math, os, urllib.request
+from datetime import datetime, timedelta, timezone
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+BASE = os.environ.get('RESEARCH_DIR') or os.path.join(ROOT, 'data')
+SUMDIR = os.path.join(BASE, 'summary')
+PATHS = os.path.join(SUMDIR, 'paths.json')
+OUT = os.path.join(SUMDIR, 'now.json')
+HIST = os.path.join(SUMDIR, 'outlook_hist.json')
+SCORE = os.path.join(SUMDIR, 'outlook_score.json')
+MAP = os.path.join(ROOT, 'adif_cty.json')
+CTY_URL = 'https://raw.githubusercontent.com/ja1bbe/ja1bbe-iono/main/docs/cty.json'
+BANDS = ['160m', '80m', '60m', '40m', '30m', '20m', '17m', '15m', '12m', '10m', '6m']
+JA_POS = (35.7, 139.7)
+TOP = 8
+RARE_MAX = 4          # 受信の割合の合計（0〜10 × 24時間）がこれ以下なら「まれ」
+OUT_RATE = 3          # 見通し：受信の割合 3割以上
+OUT_DAYS = 3          # 見通し：受信できた日 3日以上
+SCORE_DAYS = 60       # 採点の記録を残す日数
+
+now = datetime.now(timezone.utc)
+
+def rdig(c):
+    return 10 if c == 'A' else int(c) if c.isdigit() else 0
+
+def dist_km(a, b):
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    c = math.sin(la1) * math.sin(la2) + math.cos(la1) * math.cos(la2) * math.cos(lo2 - lo1)
+    return 6371.0 * math.acos(max(-1.0, min(1.0, c)))
+
+def load_json(path, default):
+    try:
+        with open(path, encoding='utf-8') as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+adif = {int(k): v for k, v in load_json(MAP, {}).items()}
+try:
+    CTY = json.loads(urllib.request.urlopen(urllib.request.Request(CTY_URL, headers={'User-Agent': 'ja1bbe-propagation/1.0'}), timeout=30).read())
+except Exception as e:
+    print('cty.json を読めませんでした：', e)
+    CTY = None
+SUM = load_json(PATHS, None)
+JAPAN = None
+if CTY:
+    for i, e in enumerate(CTY['ent']):
+        if e[0] == 'Japan':
+            JAPAN = i
+
+def ent_info(i):
+    if not CTY or i is None or i >= len(CTY['ent']):
+        return None, None
+    e = CTY['ent'][i]
+    return e[0], round(dist_km(JA_POS, (e[1], e[2])))
+
+def rarity(i, band):
+    """直近28日間の受信の割合の合計（0〜240）。記録がなければ 0"""
+    if not SUM:
+        return 0
+    d = SUM.get('e', {}).get(str(i), {}).get(band)
+    if not d or 'r' not in d:
+        return 0
+    return sum(rdig(c) for c in d['r'])
+
+# ---- 抜き取りの記録を読む（時刻の範囲を指定）
+def sample_time(sid):
+    try:
+        return datetime.strptime(sid[:12], '%Y%m%d%H%M').replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+def read_rx(t0, t1):
+    """t0〜t1 に始まった抜き取りの受信（RX）の記録。{band: {cty番号: {s:抜き取りの集合, ja:最大の日本の局数, snr:最良}}} と抜き取りの数"""
+    out = {b: {} for b in BANDS}
+    sids = set()
+    day = t0.date()
+    while day <= t1.date():
+        for path in sorted(glob.glob(os.path.join(BASE, 'pskr', f'{day:%Y}', f'{day:%m}', f'{day:%d}', '*.csv.gz'))):
+            name = os.path.basename(path)[:4]
+            try:
+                ft = datetime(day.year, day.month, day.day, int(name[:2]), int(name[2:]), tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if ft < t0 - timedelta(minutes=20) or ft > t1 + timedelta(minutes=20):
+                continue
+            with gzip.open(path, 'rt', encoding='utf-8') as f:
+                for r in csv.DictReader(f):
+                    st = sample_time(r.get('sample_id', ''))
+                    if not st or st < t0 or st >= t1:
+                        continue
+                    sids.add(r['sample_id'])
+                    if r.get('dir') != 'RX' or r.get('band') not in out:
+                        continue
+                    try:
+                        i = adif.get(int(r['dx_dxcc']))
+                    except (TypeError, ValueError):
+                        continue
+                    if i is None or i == JAPAN:
+                        continue
+                    x = out[r['band']].setdefault(i, {'s': set(), 'ja': 0, 'snr': -99.0})
+                    x['s'].add(r['sample_id'])
+                    try:
+                        x['ja'] = max(x['ja'], int(r.get('n_ja') or 0))
+                    except ValueError:
+                        pass
+                    try:
+                        x['snr'] = max(x['snr'], float(r.get('snr_p90') or -99))
+                    except ValueError:
+                        pass
+        day += timedelta(days=1)
+    return out, len(sids)
+
+def credible(x):
+    return len(x['s']) >= 2 or x['ja'] >= 2
+
+# ---- 直近3時間
+t_from = now - timedelta(hours=3)
+rx, nsamp = read_rx(t_from, now)
+recent = {}
+for b in BANDS:
+    cand = []
+    for i, x in rx[b].items():
+        if not credible(x):
+            continue
+        name, km = ent_info(i)
+        if name is None:
+            continue
+        rs = rarity(i, b)
+        cand.append({'e': i, 'name': name, 'km': km, 's': len(x['s']), 'ja': x['ja'],
+                     'snr': None if x['snr'] <= -99 else round(x['snr']), 'rare': rs <= RARE_MAX, 'rs': rs})
+    if not cand:
+        continue
+    cand.sort(key=lambda c: (not c['rare'], c['rs'] if c['rare'] else 0, -c['km']))
+    recent[b] = {'n': len(cand), 'top': [{k: v for k, v in c.items() if k != 'rs'} for c in cand[:TOP]]}
+
+# ---- これから3時間の見通し（過去の記録の部分）
+h0 = (now.hour + (1 if now.minute >= 30 else 0)) % 24
+hours = [(h0 + k) % 24 for k in range(3)]
+outlook = {}
+if SUM:
+    for b in BANDS:
+        cand = []
+        for k, ed in SUM.get('e', {}).items():
+            d = ed.get(b)
+            if not d or 'r' not in d:
+                continue
+            i = int(k)
+            if i == JAPAN:
+                continue
+            rate = max(rdig(d['r'][h]) for h in hours)
+            days = max(int(d['wd'][h], 36) if 'wd' in d else 0 for h in hours)
+            if rate < OUT_RATE or days < OUT_DAYS:
+                continue
+            name, km = ent_info(i)
+            if name is None:
+                continue
+            rs = rarity(i, b)
+            cand.append({'e': i, 'name': name, 'km': km, 'rate': rate * 10, 'days': days, 'rare': rs <= 24, 'rs': rs})
+        if not cand:
+            continue
+        # 見通しで受信されやすいものは、まれ（合計4以下）にはまずならないので、合計の小さい順（比較的珍しいもの）に並べる
+        cand.sort(key=lambda c: (c['rs'], -c['km']))
+        outlook[b] = {'n': len(cand), 'top': [{k: v for k, v in c.items() if k not in ('rs', 'rare')} for c in cand[:TOP]]}
+
+# ---- 採点：3時間前までに出した見通しを、その後の3時間の実際の受信と突き合わせる
+hist = load_json(HIST, [])
+score = load_json(SCORE, {})
+keep = []
+for h in hist:
+    t_issue = datetime.fromisoformat(h['t'])
+    if now < t_issue + timedelta(hours=3, minutes=10):
+        keep.append(h)
+        continue
+    act, n_after = read_rx(t_issue, t_issue + timedelta(hours=3))
+    if n_after < 5:                      # 抜き取りが少なすぎる窓は採点しない
+        continue
+    day = t_issue.strftime('%Y-%m-%d')
+    sd = score.setdefault(day, {})
+    for b in BANDS:
+        heard = {i for i, x in act[b].items() if credible(x)}
+        o = h.get('o', {}).get(b, [])
+        p = h.get('p', {}).get(b, [])
+        if not o and not p:
+            continue
+        s = sd.setdefault(b, [0, 0, 0, 0])   # [見通しの数, 当たり, 持続の数, 当たり]
+        s[0] += len(o); s[1] += sum(1 for i in o if i in heard)
+        s[2] += len(p); s[3] += sum(1 for i in p if i in heard)
+# 毎時最初の抜き取りで、新しい見通しを記録する
+if now.minute < 20:
+    keep.append({'t': now.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
+                 'o': {b: [c['e'] for c in v['top']] for b, v in outlook.items()},
+                 'p': {b: [c['e'] for c in v['top']] for b, v in recent.items()}})
+keep = [h for h in keep if datetime.fromisoformat(h['t']) > now - timedelta(days=1)]
+cut = (now - timedelta(days=SCORE_DAYS)).strftime('%Y-%m-%d')
+score = {d: v for d, v in sorted(score.items()) if d >= cut}
+
+# 直近7日間の採点の合計
+week = {}
+cut7 = (now - timedelta(days=7)).strftime('%Y-%m-%d')
+for d, v in score.items():
+    if d < cut7:
+        continue
+    for b, s in v.items():
+        w = week.setdefault(b, [0, 0, 0, 0])
+        for k in range(4):
+            w[k] += s[k]
+
+out = {
+    'generated': now.strftime('%Y-%m-%d %H:%MZ'),
+    'note': '日本の局が受信できた相手（PSK Reporter、20分ごとに8分間の抜き取り）。日本全体の記録で、個々の局で聞こえるとは限らない。',
+    'recent': {'from': t_from.strftime('%H:%MZ'), 'to': now.strftime('%H:%MZ'), 'samples': nsamp, 'bands': recent},
+    'outlook': {'hours': hours, 'days': SUM.get('days') if SUM else None, 'bands': outlook},
+    'score7': week,
+}
+os.makedirs(SUMDIR, exist_ok=True)
+with open(OUT, 'w', encoding='utf-8') as f:
+    json.dump(out, f, ensure_ascii=False, separators=(',', ':'))
+with open(HIST, 'w', encoding='utf-8') as f:
+    json.dump(keep, f, separators=(',', ':'))
+with open(SCORE, 'w', encoding='utf-8') as f:
+    json.dump(score, f, separators=(',', ':'))
+print(f"直近3時間：抜き取り{nsamp}回、{sum(v['n'] for v in recent.values())} エンティティ×バンド。見通し：{len(outlook)}バンド。採点の窓：{len(keep)}")
