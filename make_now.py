@@ -9,6 +9,8 @@
              160m・80m・60m では短経路か長経路の半分以上が夜のときだけ
            ・160m・80m・60m は、日本側の太陽高度が +5° 以上（はっきり昼）の受信を、局数にかかわらず載せない
              （読み違いや、ありえない受信の報告を除くため。日の出・日没の前後のグレイラインの受信は残る）
+           ・ただし、同じエンティティ×バンドを日本の局が DXクラスターでスポットしていて、抜き取りの前後20分に入っていれば、
+             1局1回の受信でも採る（spot の印を付ける）
            ・「最近の日本の記録ではまれ」なものを先に、残りを遠い順に、各バンド最大8つ
   outlook：これから3時間の見通し（過去の記録の部分だけ。宇宙天気による補正は、読む側が最新の値で行う）
            ・直近28日間の集計（paths.json）で、これからの3時間のいずれかに受信の割合が3割以上、
@@ -134,8 +136,9 @@ def read_rx(t0, t1):
                         continue
                     if i is None or i == JAPAN:
                         continue
-                    x = out[r['band']].setdefault(i, {'s': set(), 'ja': 0, 'snr': -99.0, 'areas': set(), 'last': st})
+                    x = out[r['band']].setdefault(i, {'s': set(), 'ja': 0, 'snr': -99.0, 'areas': set(), 'last': st, 'times': set()})
                     x['s'].add(r['sample_id'])
+                    x['times'].add(st)
                     x['areas'].add(r.get('ja_area'))
                     if st > x['last']:
                         x['last'] = st
@@ -175,7 +178,43 @@ def dark_frac(b, t, long_path=False, n=60):
             dk += 1
     return dk / (n + 1)
 
+# ---- DXクラスターの日本の局のスポット（cluster_collect.py の記録。ent は cty.json の番号）
+_SPOTS = None
+def spots():
+    global _SPOTS
+    if _SPOTS is None:
+        _SPOTS = {}
+        for path in sorted(glob.glob(os.path.join(BASE, 'cluster', '*.csv')))[-2:]:
+            try:
+                with open(path, encoding='utf-8') as f:
+                    for r in csv.DictReader(f):
+                        try:
+                            t = datetime.strptime(r['time_utc'], '%Y-%m-%d %H:%M').replace(tzinfo=timezone.utc)
+                            _SPOTS.setdefault((r['band'], int(r['ent'])), []).append(t)
+                        except (KeyError, ValueError):
+                            continue
+            except OSError:
+                continue
+    return _SPOTS
+
+def spotted(x, band, ent):
+    # 同じエンティティ×バンドを、日本の局が DXクラスターでスポットしていて、抜き取りの前後20分に入っていれば True
+    if band is None or ent is None:
+        return False
+    ts = spots().get((band, ent))
+    if not ts:
+        return False
+    for st in x.get('times', ()):
+        lo, hi = st - timedelta(minutes=20), st + timedelta(minutes=28)
+        if any(lo <= t <= hi for t in ts):
+            return True
+    return False
+
 def credible(x, band=None, ent=None):
+    # DXクラスターのスポットと PSK の受信が同じ時間帯にそろったものは、1局1回でも採る（人の確認と機械の受信が互いを裏付けるため）
+    if spotted(x, band, ent):
+        x['spot'] = True
+        return True
     # 日本の局2局以上、または2つ以上のコールエリアから報告されたものは載せる
     if x['ja'] >= 2 or len(x['areas']) >= 2:
         return True
@@ -201,7 +240,8 @@ for b in BANDS:
             continue
         rs = rarity(i, b)
         cand.append({'e': i, 'name': name, 'km': km, 's': len(x['s']), 'ja': x['ja'],
-                     'snr': None if x['snr'] <= -99 else round(x['snr']), 'rare': rs <= RARE_MAX, 'rs': rs})
+                     'snr': None if x['snr'] <= -99 else round(x['snr']), 'rare': rs <= RARE_MAX, 'rs': rs,
+                     'spot': bool(x.get('spot'))})
     if not cand:
         continue
     cand.sort(key=lambda c: (not c['rare'], c['rs'] if c['rare'] else 0, -c['km']))
